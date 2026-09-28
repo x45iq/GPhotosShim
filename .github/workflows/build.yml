@@ -1,0 +1,98 @@
+name: Build APK
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # The secrets context is not available in step `if` conditions, so expose it via env
+      HAS_RELEASE_SIGNING: ${{ github.event_name != 'pull_request' && secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.2 build-tools;36.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      # Release signing: add these repository secrets to get a signed release APK
+      #   RELEASE_KEYSTORE_BASE64  - keystore file encoded with `base64 -w0 release.jks`
+      #   RELEASE_STORE_PASSWORD
+      #   RELEASE_KEY_ALIAS
+      #   RELEASE_KEY_PASSWORD
+      - name: Prepare release signing
+        if: ${{ env.HAS_RELEASE_SIGNING == 'true' }}
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/release.jks"
+            echo "RELEASE_STORE_PASSWORD=$RELEASE_STORE_PASSWORD"
+            echo "RELEASE_KEY_ALIAS=$RELEASE_KEY_ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$RELEASE_KEY_PASSWORD"
+          } > local.properties
+
+      - name: Build release APK
+        if: ${{ env.HAS_RELEASE_SIGNING == 'true' }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Remove signing material
+        if: ${{ always() }}
+        run: rm -f local.properties "$RUNNER_TEMP/release.jks"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPhotosShim-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        if: ${{ env.HAS_RELEASE_SIGNING == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPhotosShim-release
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      # Pushing a tag like v1.3.0 publishes the signed release APK to GitHub Releases
+      # as GPhotosShim.apk. Requires the release signing secrets.
+      - name: Prepare release asset
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && env.HAS_RELEASE_SIGNING == 'true' }}
+        run: cp app/build/outputs/apk/release/app-release.apk GPhotosShim.apk
+
+      - name: Publish GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && env.HAS_RELEASE_SIGNING == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: GPhotosShim ${{ github.ref_name }}
+          files: GPhotosShim.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
